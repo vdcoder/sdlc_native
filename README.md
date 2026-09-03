@@ -1,5 +1,3 @@
----
-
 # SDLC Native Multi-Agents
 
 ### Before we automate the engineering organization, can we automate one engineering loop we can actually trust?
