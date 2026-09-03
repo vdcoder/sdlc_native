@@ -1,5 +1,7 @@
 # SDLC Native Multi-Agents
 
+![SDLC Native Multi-Agents](SDLCNative.png)
+
 ### Before we automate the engineering organization, can we automate one engineering loop we can actually trust?
 
 A few hours before this repository existed, I was in a job interview discussing what an **AI-native software organization** might look like.
