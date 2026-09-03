@@ -1,80 +1,96 @@
-# sdlc_native_multi_agents
+---
 
-**A local, working multi-agent SDLC pipeline: real LLM-driven agents that code, test, and review pull requests — built on native [LangGraph](https://langchain-ai.github.io/langgraph/) primitives.**
+# SDLC Native Multi-Agents
 
-Drop a ticket (a small JSON file, optionally pointing at a git repo) into `jira_tickets/`, and an autonomous pipeline clones the repo, writes code to satisfy the requirement, tests its own work, self-heals on failure, packages the result, and runs an independent PR review — each stage a real LLM agent using real filesystem tools, sandboxed to its own workspace.
+### Before we automate the engineering organization, can we automate one engineering loop we can actually trust?
 
+A few hours before this repository existed, I was in a job interview discussing what an **AI-native software organization** might look like.
+
+The conversation eventually reached multiple agents: coding agents, testing agents, review agents, agents delegating work to other agents, and an engineering organization increasingly built around autonomous AI collaboration.
+
+It is an exciting direction.
+
+But something bothered me.
+
+If the goal is to automate more and more of the software-development lifecycle, I don't think the first architectural step should be:
+
+> *Give several autonomous agents a problem and let them figure out how to organize themselves.*
+
+I think the first step should be considerably less magical:
+
+> **Build one deterministic, observable and verifiable engineering graph — then place AI inside the steps where probabilistic reasoning is actually useful.**
+
+That is what this repository explores.
+
+It is a small, fully working agentic SDLC pipeline built with native LangGraph primitives.
+
+Give it a ticket and, without pretending Jira or GitHub integrations exist where they do not, the real pipeline will:
+
+**clone → inspect → code → test → repair → package → independently review**
+
+The coder, tester, and reviewer are real LLM-driven agents using real filesystem tools. But they do **not** own the engineering process.
+
+**The graph does.**
+
+```text
+                    ┌──────────── retry ────────────┐
+                    │                               │
+                    ▼                               │
+Ticket → Clone → Coder Agent → Tester Agent ────────┘
+                                │
+                              PASS
+                                │
+                                ▼
+                             Package
+                                │
+                                ▼
+                        Independent Review
+                                │
+                                ▼
+                               END
 ```
-python main.py jira_tickets/my_ticket.json
-```
 
-or watch the folder and process tickets as they arrive, fully in parallel:
+The AI is probabilistic.
 
-```
-python watcher.py
-```
+The workflow is not.
 
 ---
 
-## 1. Architecture
+## Why build it this way?
 
-```
-   START
-     │
-     ▼
- jira_ingest ──────────────────────────────────────────────┐
-     │  (provisions branch, resets registers)               │
-     ▼                                                       │
- git_clone   (classic node, no LLM — clones repo_url if set) │
-     │                                                       │
-     ▼                                                       │
- coder_agent  <───────────────────────────┐                  │
-     │           self-healing retry loop  │                  │
-     ▼                                    │ loop_count < 3    │
- tester_agent ──[route_validation_gate]───┘                   │
-     │            │                                            │
-     │ pass        └─ loop_count >= 3 ──┐                       │
-     ▼                                  │                       │
- qa_package  <────────────────────────┘                       │
- (packages workspace -> github_PRS/<ticket>/{repo,QA,PR_review})
-     │
-     ▼
- pr_review_agent ─────────────────────────────────────────────► END
-```
+There are two very different things we can automate:
 
-Any of `coder_agent` / `tester_agent` / `pr_review_agent` can call an `ask_human` tool mid-loop — a real, blocking terminal prompt — if it genuinely needs a human's input. There's no separate hardcoded approval gate; a human is pulled in only when an agent actually asks.
+1. **reasoning**
+2. **authority**
 
-### Centralized state (`SDLCState`)
+LLMs are increasingly excellent at the first.
 
-Every node is a pure function `SDLCState -> dict`, returning only the fields it changes; LangGraph merges the update into the checkpointed state. Concurrent tickets are isolated by `thread_id`, and every state transition is persisted by the `MemorySaver` checkpointer — `app.get_state_history(config)` gives a full, replayable audit trail of a ticket's lifecycle (printed as an ASCII table at the end of each run).
+That does not mean they should automatically receive the second.
 
-### Nodes
+In this project, an agent can inspect code, decide what should change, write files, evaluate another agent's work, and even ask a human for help.
 
-| Node | Responsibility |
-|---|---|
-| `jira_ingest` | Mocks the inbound Jira webhook, provisions a branch name, resets all working registers |
-| `git_clone` | Classic node (no LLM). Clones `repo_url` into a curated per-ticket workspace, or falls back to a scratch folder if the ticket has none |
-| `coder_agent` | Real LLM ReAct agent. Explores the workspace and writes code/files to satisfy `requirements` |
-| `tester_agent` | Real LLM ReAct agent. Reviews the workspace, may patch small issues itself, and renders a pass/fail verdict with a stated reason |
-| `qa_package` | Classic node (no LLM). Copies the workspace into `github_PRS/<ticket>/repo`, creates sibling `QA/` and `PR_review/` folders, writes `QA_results.md` from the tester's verdict |
-| `pr_review_agent` | A second, independent LLM ReAct agent (read-only). Reviews the packaged repo copy as a pull request and writes `PR_review_results.md` with an approve/reject verdict |
+But the surrounding application still determines:
 
-### Control routine
+* what role the agent occupies;
+* what tools it receives;
+* what filesystem it can touch;
+* what state transition follows;
+* how many retries it gets;
+* when work is packaged;
+* what another independent agent reviews;
+* and when the workflow ends.
 
-```python
-def route_validation_gate(state: SDLCState) -> Literal["coder_agent", "qa_package"]:
-    if state["test_passed"] or state["loop_count"] >= MAX_LOOP_ATTEMPTS:
-        return "qa_package"   # ship it for review either way — win or budget exhausted
-    return "coder_agent"      # self-healing retry
-```
+That distinction is intentional.
 
-`MAX_LOOP_ATTEMPTS` (default 3) is the token-cost circuit breaker: `coder_agent` ↔ `tester_agent` cannot loop forever. Once the budget is exhausted, the ticket still gets packaged and reviewed — the human/reviewer sees exactly what was attempted and why it didn't pass, instead of the pipeline silently failing.
+The architecture is not trying to eliminate autonomous agents.
+
+It is trying to give autonomy **boundaries**.
 
 ---
 
-## 2. Ticket files
+# A ticket becomes a graph execution
 
-A ticket is a small JSON file:
+Drop a small JSON ticket into `jira_tickets/`:
 
 ```json
 {
@@ -84,95 +100,397 @@ A ticket is a small JSON file:
 }
 ```
 
-- `jira_ticket_id` and `requirements` are required.
-- `repo_url` is optional — omit it and `coder_agent` gets a plain scratch folder instead of a cloned repo.
+`jira_ticket_id` and `requirements` are required. `repo_url` is optional — leave it out and the coder gets a plain scratch folder instead of a cloned repo.
 
-### Where things end up
+Then run:
+
+```bash
+python main.py jira_tickets/my_ticket.json
+```
+
+Or let the watcher process incoming tickets independently and in parallel:
+
+```bash
+python watcher.py
+```
+
+The system will clone the requested repository, create an isolated workspace, let a coding agent inspect and modify it, send the result through an independent testing agent, retry failed work up to a bounded budget, package the result, and finally give a read-only copy to a separate PR-review agent. 
+
+Everything it produces lands somewhere predictable:
 
 | Path | Contents |
 |---|---|
-| `jira_tickets/` | Inbox — drop new ticket files here (watched by `watcher.py`) |
+| `jira_tickets/` | Inbox — drop new ticket files here |
 | `jira_tickets_done/` | Ticket files moved here (unmodified) once processing completes |
-| `workspace/<ticket>/` | The cloned repo (or scratch dir) `coder_agent`/`tester_agent` actually edit |
+| `workspace/<ticket>/` | The cloned repo (or scratch dir) the coder/tester actually edit |
 | `github_PRS/<ticket>/repo/` | A packaged copy of the workspace, frozen at review time |
-| `github_PRS/<ticket>/QA/QA_results.md` | The tester's verdict + reasoning (and any self-patches it made) |
-| `github_PRS/<ticket>/PR_review/PR_review_results.md` | The PR reviewer's verdict + reasoning |
+| `github_PRS/<ticket>/QA/QA_results.md` | The tester's verdict + reasoning |
+| `github_PRS/<ticket>/PR_review/PR_review_results.md` | The reviewer's verdict + reasoning |
 
-`workspace/`, `github_PRS/`, and `jira_tickets_done/` are all generated at runtime and gitignored.
+This is not a simulated sequence of prompts.
 
----
+The filesystem operations are real.
 
-## 3. Agents & tools
+The generated code is real.
 
-`coder_agent` and `tester_agent` share the same tools, each running in a bounded ReAct loop (ask the model for one JSON tool call, execute it for real, feed the result back, repeat):
+The tests and verdicts are real.
 
-- `list_file_names` / `read_file` / `write_file` — real filesystem operations
-- `ask_human` — a genuine blocking terminal prompt for when an agent needs a person
-- `finish` (coder) / `finish` with `passed`+`reason` (tester) — ends the loop with a verdict
+The repair loop is real.
 
-`pr_review_agent` is read-only (`list_file_names` / `read_file` / `ask_human`) and ends with `approve_pr` or `reject_pr`, each carrying a `reason`.
+The independent review is real.
 
-**Sandboxing:** every tool call is resolved through `make_sandboxed_tools(root)`, which confines all paths to the agent's intended root (the ticket's `workspace/` dir, or the packaged `github_PRS/.../repo` for the reviewer) — regardless of what path string the model actually passes in (`"."`, an absolute path, `../..`, etc.). An agent cannot read or write outside the folder it was scoped to.
-
-Small local models occasionally emit slightly malformed JSON (e.g. `{"tool": "finish": {}}` instead of `{"tool": "finish", "args": {}}`); `parse_tool_call` tolerates this, and a genuinely unparseable reply gets one corrective nudge before falling back, rather than silently giving up.
+Only the Jira/GitHub edges are mocked so the experiment remains self-contained. 
 
 ---
 
-## 4. LLM-agnostic model layer
+# The graph is the engineering contract
 
-Every agent is written against LangChain's `BaseChatModel` interface via `get_llm()`. Swapping providers is a `.env` change, not a code change:
+The topology is deliberately simple:
 
-```bash
-LLM_PROVIDER=ollama     # default, local/offline, no API key — LLM_MODEL=qwen2.5-coder
-LLM_PROVIDER=openai     # requires OPENAI_API_KEY   — LLM_MODEL=gpt-4o-mini
-LLM_PROVIDER=gemini     # requires GOOGLE_API_KEY
-LLM_PROVIDER=anthropic  # requires ANTHROPIC_API_KEY
+```text
+START
+  │
+  ▼
+jira_ingest
+  │
+  ▼
+git_clone
+  │
+  ▼
+coder_agent ◄─────────────────┐
+  │                           │
+  ▼                           │
+tester_agent                  │
+  │                           │
+  ├── fail + budget left ─────┘
+  │
+  ▼
+qa_package
+  │
+  ▼
+pr_review_agent
+  │
+  ▼
+END
 ```
 
-Copy `.env.example` to `.env` and fill in the provider/model/key you want to use.
+Three nodes contain LLM-driven reasoning:
+
+* `coder_agent`
+* `tester_agent`
+* `pr_review_agent`
+
+The rest are ordinary deterministic software.
+
+That distinction matters.
+
+A conventional function should remain a conventional function when reasoning is unnecessary. There is little value in asking an LLM to clone a Git repository or copy a directory merely so that every rectangle in an architecture diagram can be called an agent.
+
+**Use intelligence where intelligence adds value. Use software everywhere else.**
 
 ---
 
-## 5. External agent delegation
+# The agents are powerful, but deliberately unequal
 
-Any node can outsource its work entirely to an external service instead of calling an LLM locally — useful for heavier compute, specialized models, or hardware a different machine owns. Set the matching env var to a URL:
+The coder can explore and modify its workspace.
 
-```bash
+The tester can inspect that work, execute its own reasoning, make small corrections, and decide whether the implementation passes.
+
+The final reviewer gets a frozen packaged copy and is **read-only**.
+
+It can approve or reject.
+
+It cannot quietly repair the evidence it is supposed to judge.
+
+That separation gives us something closer to an engineering process than a single giant prompt pretending to contain one.
+
+The agents use bounded ReAct-style tool loops with real filesystem tools, and all paths are resolved through sandboxed tool implementations so an agent cannot escape the workspace it was assigned—even if the model attempts an absolute path or `../..`. 
+
+---
+
+# Failure is part of the architecture
+
+An autonomous loop without a stopping condition is not autonomy.
+
+It is a billing incident.
+
+The coder/tester repair cycle therefore has an explicit retry budget:
+
+```python
+def route_validation_gate(state: SDLCState) -> Literal["coder_agent", "qa_package"]:
+    if state["test_passed"] or state["loop_count"] >= MAX_LOOP_ATTEMPTS:
+        return "qa_package"
+
+    return "coder_agent"
+```
+
+By default, the system allows three attempts.
+
+If the implementation still fails, the ticket does **not** disappear into an infinite self-healing fantasy.
+
+It moves forward carrying the evidence of failure.
+
+The QA package records what happened, and the reviewer receives the imperfect result.
+
+A human can see:
+
+> what was attempted,
+> what failed,
+> and why the system stopped.
+
+The retry limit is therefore simultaneously a reliability boundary and a token-cost circuit breaker. 
+
+There is a smaller version of the same idea one level down: each agent's own tool-calling loop — explore, read, write, decide — is capped too, by default at six steps per attempt. A single confused agent can't spin forever inside its own turn, either.
+
+---
+
+# Humans are available without becoming a mandatory ceremony
+
+Any reasoning agent can call:
+
+```text
+ask_human
+```
+
+when it genuinely needs information.
+
+There is intentionally no universal:
+
+```text
+AI → HUMAN APPROVAL → AI → HUMAN APPROVAL → AI
+```
+
+pipeline.
+
+That would preserve human control by destroying most of the useful autonomy.
+
+Instead, the human is another capability available to the agent when uncertainty actually requires escalation.
+
+The human is not removed.
+
+The human is **pulled into the graph deliberately**. 
+
+---
+
+# State should be inspectable
+
+Every node operates against one centralized `SDLCState`.
+
+A node receives:
+
+```text
+SDLCState
+```
+
+and returns only the fields it changed.
+
+LangGraph merges those changes into checkpointed state.
+
+Each concurrent ticket receives its own `thread_id`, and every transition can be inspected through state history. The result is a replayable lifecycle of the ticket rather than an opaque conversation that happened somewhere inside an agent runtime. 
+
+For an enterprise SDLC, this becomes increasingly important.
+
+If an AI changes production software, eventually someone will ask:
+
+> Why did it do that?
+
+“Because the agent decided to” is not a sufficient audit trail.
+
+---
+
+# Multiple agents do not have to mean uncontrolled agent-to-agent authority
+
+This experiment also supports something I wanted to test explicitly.
+
+Any agent node can be delegated to an external agent service:
+
+```env
 EXTERNAL_AGENT_CODER=http://localhost:9000/coder
 EXTERNAL_AGENT_TESTER=http://localhost:9000/tester
 EXTERNAL_AGENT_PR_REVIEW=http://localhost:9000/pr-review
 ```
 
-When set, `send_requirements()` POSTs `{"jira_ticket_id": ..., "requirements": ...}` to that URL and blocks for the response:
+The external agent can reason elsewhere—even on another machine, model, framework, or hardware architecture—and return the ordered tool actions it wants performed.
 
-```json
-{
-  "tool_calls": [
-    {"tool": "list_file_names", "args": {"directory": "."}},
-    {"tool": "read_file", "args": {"path": "README"}},
-    {"tool": "write_file", "args": {"path": "summary.txt", "content": "..."}},
-    {"tool": "finish", "args": {}}
-  ]
-}
-```
+But those actions are replayed **locally through the same sandboxed tools**.
 
-The node replays that ordered list of tool calls through its own sandboxed tools — the external agent decides *what* to do, but every filesystem effect still runs locally, through the same containment guarantees as the built-in LLM loop.
+So the remote agent can decide:
+
+> *what should happen*
+
+without automatically receiving authority over:
+
+> *where and how it happens.*
+
+That separation may be considerably more interesting than simply connecting Agent A directly to Agent B.
+
+It lets the deterministic graph remain the protocol between potentially heterogeneous forms of intelligence. 
 
 ---
 
-## 6. Running it
+# Model independence
+
+The pipeline does not require one model provider.
+
+Agents use LangChain's `BaseChatModel` abstraction, and the provider can be changed through configuration:
+
+```env
+LLM_PROVIDER=ollama
+LLM_PROVIDER=openai
+LLM_PROVIDER=gemini
+LLM_PROVIDER=anthropic
+```
+
+The default can run locally through Ollama with a coding model, allowing the entire experiment to operate offline and without an API key. 
+
+This becomes particularly interesting when combined with external delegation:
+
+A cheap local model may handle one stage.
+
+A frontier model may handle another.
+
+Specialized compute may perform a third.
+
+The graph doesn't have to care.
+
+---
+
+# Why LangGraph?
+
+I wanted the experiment to expose the control structure rather than hide it behind a large autonomous-agent abstraction.
+
+LangGraph gives us exactly the useful primitive:
+
+> **state + nodes + edges + conditional transitions**
+
+The interesting engineering question then becomes:
+
+> Where should reasoning live?
+
+rather than:
+
+> Which agent framework should control my application?
+
+That is a distinction I care about in most of my AI work.
+
+---
+
+# What this is not
+
+This is not an assertion that this particular graph should run an enterprise engineering organization tomorrow.
+
+It is deliberately small.
+
+It has:
+
+* mocked Jira ingestion;
+* mocked GitHub publication;
+* in-memory checkpointing;
+* process-level ticket concurrency;
+* a deliberately limited set of tools.
+
+Those constraints make the experiment understandable.
+
+They also create obvious next steps: durable checkpoints, real Jira/GitHub adapters, security scanning, production evaluation gates, more sophisticated test environments, richer observability, and specialized external agents. 
+
+---
+
+# Where I think this can go
+
+The graph could eventually become much richer:
+
+```text
+Requirement
+    │
+    ▼
+Requirement Analysis
+    │
+    ▼
+Architecture Gate
+    │
+    ▼
+Implementation
+    │
+    ▼
+Unit / Integration Testing
+    │
+    ├──── repair loop
+    │
+    ▼
+Security Review
+    │
+    ├──── repair loop
+    │
+    ▼
+Performance Evaluation
+    │
+    ▼
+PR Review
+    │
+    ▼
+Human / Policy Gate
+    │
+    ▼
+Deployment
+    │
+    ▼
+Production Observation
+    │
+    └────► new evidence enters future evaluations
+```
+
+Some nodes may be deterministic.
+
+Some may contain one model.
+
+Some may contain a local agent.
+
+Some may delegate to a specialized external agent.
+
+Some may require a human.
+
+The important part is that **the engineering process itself remains explicit**.
+
+---
+
+# The hypothesis
+
+This repository is testing a simple hypothesis:
+
+> **An AI-native engineering organization does not have to begin by replacing its development process with autonomous agents.**
+
+It can begin by making the development process **machine-executable**.
+
+Then we can gradually decide which steps deserve intelligence, which deserve autonomy, which require verification, and which still require people.
+
+Perhaps eventually many autonomous engineering agents will negotiate, delegate, specialize, and collaborate with one another.
+
+I suspect they will.
+
+But before building a society of software engineers made of AI, I would like to know that **one ticket can travel through one graph and leave behind evidence that I can understand and verify.**
+
+This repository is that first experiment.
+
+---
+
+## Running it
 
 ```bash
 python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt   # Windows
-# source .venv/bin/activate && pip install -r requirements.txt   # macOS/Linux
 
-cp .env.example .env   # then fill in your LLM_PROVIDER / API key
+# Windows
+.venv\Scripts\pip install -r requirements.txt
+
+# macOS / Linux
+source .venv/bin/activate
+pip install -r requirements.txt
+
+cp .env.example .env
 
 python main.py jira_tickets/my_ticket.json
 ```
 
-Or run the folder watcher to process tickets as they arrive — each new file spawns a fully independent, parallel `python main.py` process:
+Or:
 
 ```bash
 python watcher.py
@@ -180,18 +498,34 @@ python watcher.py
 
 ---
 
-## 7. Design constraints (by intent, not oversight)
+## Extending it
 
-- **No real Jira/GitHub integration.** `jira_ingest` and the branch-provisioning print statements are mocks — this keeps the artifact self-contained and portable. Everything downstream of that (cloning, coding, testing, reviewing) is real.
-- **`MemorySaver` checkpointer.** In-memory, per-process. Swapping to a durable backend (Postgres, SQLite) for checkpoints that survive a restart is a one-line change (`from langgraph.checkpoint.postgres import PostgresSaver`), with zero changes to graph topology or node logic.
-- **Concurrency is process-level, not in-process.** `watcher.py` spawns one OS process per ticket via `subprocess.Popen` rather than running multiple tickets on one event loop — simple, robust, and trivially parallel across tickets.
+Good next experiments include:
+
+* persistent PostgreSQL checkpoints;
+* real Jira and GitHub adapters;
+* security and adversarial-review nodes;
+* executable test runners;
+* performance gates;
+* LLM evaluation and release thresholds;
+* record/replay of failed agent trajectories;
+* richer human escalation;
+* cost/latency-aware model routing;
+* specialized external agents;
+* multiple implementations competing against the same evaluation gate.
 
 ---
 
-## 8. Extending this platform
+## One final principle
 
-- Swap `MemorySaver` for a durable checkpointer to persist audit trails across restarts.
-- Replace `jira_ingest`'s mocked webhook/branch calls with real Jira/GitHub SDK calls behind the same function signature.
-- Add more conditional gates (e.g. a security-scan agent with its own bounded retry loop) by composing additional `add_conditional_edges` calls.
-- Build a real external agent server against the `send_requirements` protocol to outsource a node to specialized compute.
+**AI should be allowed to reason broadly before it is allowed to act broadly.**
 
+That separation is cheap to design at the beginning.
+
+It becomes very expensive to rediscover after autonomy has already spread through the system.
+
+---
+
+This README, and every guardrail described in it, took shape through an actual back-and-forth with GitHub Copilot (Claude Sonnet 5) — genuinely a co-creator on this one, not just an autocomplete.
+
+---
