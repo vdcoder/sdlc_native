@@ -1,4 +1,4 @@
-# SDLC Native Multi-Agents
+# SDLC Native (Multi-Agents)
 
 ![SDLC Native Multi-Agents](SDLCNative.png)
 
